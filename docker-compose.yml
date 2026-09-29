@@ -41,6 +41,9 @@ services:
       - WEBHOOK_URL=http://localhost:5678/
       - GENERIC_TIMEZONE=${TIMEZONE:-UTC}
       - N8N_RESTRICT_FILE_ACCESS_TO=/files
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     ports:
       - "5678:5678"
     volumes:

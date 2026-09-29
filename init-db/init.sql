@@ -14,7 +14,7 @@ CREATE TABLE IF NOT EXISTS conversations (
 CREATE TABLE IF NOT EXISTS escalation_tickets (
     id SERIAL PRIMARY KEY,
     conversation_id INTEGER REFERENCES conversations(id) ON DELETE CASCADE,
-    status VARCHAR(20) DEFAULT 'open' CHECK (status IN ('open','in_progress','resolved')),
+    status VARCHAR(20) DEFAULT 'open' CHECK (status IN ('open','in_progress','approved','rejected','resolved')),
     assigned_to VARCHAR(100),
     notes TEXT,
     created_at TIMESTAMPTZ DEFAULT NOW(),
