@@ -1,2 +1,11 @@
 .env
 n8n-files/
+
+# Node
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+
+# Secrets-free workflow export is committed; credential exports are not.
+workflows/*-cred.json
