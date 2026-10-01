@@ -79,9 +79,49 @@ async function main() {
     return `id=${row.id}`;
   });
 
-  await expectRejection('conversations.request_id NOT NULL enforced', () =>
-    db.query("INSERT INTO conversations (question, answer, confidence) VALUES ('a','b','low')"),
-  );
+  await check('conversations.request_id accepts NULL (legacy rows)', async () => {
+    const r = await db.query<{ id: number }>(
+      `INSERT INTO conversations (question, answer, confidence, request_id)
+       VALUES ('verify: nullable request_id', 'b', 'low', NULL) RETURNING id`,
+    );
+    const id = r.rows[0]!.id;
+    await db.query('DELETE FROM conversations WHERE id = $1', [id]);
+    return 'accepted';
+  });
+
+  await check('multiple NULL request_ids do not collide', async () => {
+    for (let i = 0; i < 2; i++) {
+      await db.query(
+        `INSERT INTO conversations (question, answer, confidence, request_id)
+         VALUES ('verify: null dup', 'b', 'low', NULL)`,
+      );
+    }
+    const n = await db.query(
+      `SELECT count(*) FROM conversations WHERE question = 'verify: null dup'`,
+    );
+    await db.query(`DELETE FROM conversations WHERE question = 'verify: null dup'`);
+    if (Number(n.rows[0]?.count) !== 2) throw new Error('expected 2, unique index is blocking NULLs');
+    return '2 NULLs coexist';
+  });
+
+  await expectRejection('duplicate non-null request_id still rejected', async () => {
+    const shared = randomUUID();
+    await db.query(
+      `INSERT INTO conversations (question, answer, confidence, request_id)
+       VALUES ('verify: dup a', 'b', 'low', $1)`,
+      [shared],
+    );
+    try {
+      await db.query(
+        `INSERT INTO conversations (question, answer, confidence, request_id)
+         VALUES ('verify: dup b', 'b', 'low', $1)`,
+        [shared],
+      );
+    } finally {
+      await db.query(`DELETE FROM conversations WHERE question LIKE 'verify: dup%'`);
+    }
+    return null;
+  });
   await expectRejection('conversations.confidence CHECK enforced', () =>
     db.query(
       "INSERT INTO conversations (question, answer, confidence, request_id) VALUES ('a','b','bogus', gen_random_uuid())",
@@ -103,17 +143,100 @@ async function main() {
     ),
   );
 
-  process.stdout.write('\nTicket lifecycle\n');
-  await check('all 7 statuses accepted by CHECK', async () => {
-    const statuses = ['open','pending','approved','rejected','timed_out','in_progress','resolved'];
-    for (const s of statuses) {
+  process.stdout.write('\nDecider attribution invariant\n');
+  await expectRejection('approved with no decider rejected', () =>
+    db.query(
+      "INSERT INTO escalation_tickets (status, decided_at, request_id) VALUES ('approved', NOW(), gen_random_uuid())",
+    ),
+  );
+  await expectRejection('approved with both deciders rejected', async () => {
+    const u = await users.create({
+      email: `verify-both-${Date.now()}@example.com`,
+      passwordHash: 'x',
+      role: 'admin',
+    });
+    try {
+      await db.query(
+        `INSERT INTO escalation_tickets (status, decided_by, decided_by_slack, decided_at, request_id)
+         VALUES ('approved', $1, 'U0DUAL', NOW(), gen_random_uuid())`,
+        [u.id],
+      );
+    } finally {
+      await db.query('DELETE FROM admin_users WHERE id = $1', [u.id]);
+    }
+    return null;
+  });
+  await expectRejection('timed_out without decided_at/decision_channel rejected', () =>
+    db.query(
+      "INSERT INTO escalation_tickets (status, request_id) VALUES ('timed_out', gen_random_uuid())",
+    ),
+  );
+  await check('pending and open need no decider', async () => {
+    for (const s of ['pending', 'open']) {
       const r = await db.query(
         'INSERT INTO escalation_tickets (status, request_id) VALUES ($1, gen_random_uuid()) RETURNING id',
         [s],
       );
       unlinkedIds.push(r.rows[0].id as number);
     }
-    return `${statuses.length} statuses accepted`;
+    return 'accepted';
+  });
+  await check('approved with exactly one slack decider accepted', async () => {
+    const r = await db.query(
+      `INSERT INTO escalation_tickets (status, decided_by_slack, decided_at, decision_channel, request_id)
+       VALUES ('approved', 'U0ONE', NOW(), 'slack', gen_random_uuid()) RETURNING id`,
+    );
+    unlinkedIds.push(r.rows[0].id as number);
+    return 'accepted';
+  });
+  await check('sweeper-produced timeout satisfies the invariant', async () => {
+    const t = await tickets.createPending({ conversationId: convId, requestId: reqId });
+    await db.query(
+      "UPDATE escalation_tickets SET created_at = NOW() - interval '60 minutes' WHERE id = $1",
+      [t.id],
+    );
+    await tickets.markStalePendingTimedOut(45);
+    const after = await tickets.findById(t.id);
+    if (after?.status !== 'timed_out') throw new Error('not timed_out');
+    if (after.decision_channel !== 'api') throw new Error('decision_channel should be api');
+    return 'timed_out + channel=api';
+  });
+
+  process.stdout.write('\nTicket lifecycle\n');
+  // Each status needs its accompanying decider columns, since the
+  // decider_present_check from migration 009 binds status and attribution
+  // together. This asserts the status CHECK accepts every legal value without
+  // asserting that a bare insert is sufficient.
+  await check('all 7 statuses accepted by CHECK', async () => {
+    const cases: { status: string; decider: string | null }[] = [
+      { status: 'open', decider: null },
+      { status: 'pending', decider: null },
+      { status: 'approved', decider: 'slack' },
+      { status: 'rejected', decider: 'slack' },
+      { status: 'in_progress', decider: 'slack' },
+      { status: 'resolved', decider: 'slack' },
+      { status: 'timed_out', decider: 'api' },
+    ];
+    for (const { status, decider } of cases) {
+      const cols = ['status'];
+      const vals: unknown[] = [status];
+      if (decider === 'slack') {
+        cols.push('decided_by_slack', 'decided_at');
+        vals.push('U0ALL7', new Date());
+      } else if (decider === 'api') {
+        cols.push('decision_channel', 'decided_at');
+        vals.push('api', new Date());
+      }
+      cols.push('request_id');
+      vals.push(randomUUID());
+      const r = await db.query<{ id: number }>(
+        `INSERT INTO escalation_tickets (${cols.join(', ')})
+         VALUES (${vals.map((_, i) => `$${i + 1}`).join(', ')}) RETURNING id`,
+        vals,
+      );
+      unlinkedIds.push(r.rows[0]!.id);
+    }
+    return `${cases.length} statuses accepted`;
   });
 
   await check('approved -> in_progress -> resolved triage chain', async () => {
@@ -234,9 +357,17 @@ async function main() {
     );
   });
 
+  await check('triage refuses to decide a pending ticket', async () => {
+    const t = await tickets.createPending({ conversationId: convId, requestId: reqId });
+    const got = await tickets.triage({ id: t.id, status: 'in_progress' });
+    if (got !== null) throw new Error('pending ticket was triaged without a decision');
+    return 'correctly refused';
+  });
+
   process.stdout.write('\nAudit trail\n');
   await check('audit + ticket change commit atomically', async () => {
     const t = await tickets.createPending({ conversationId: convId, requestId: reqId });
+    await tickets.decide({ id: t.id, status: 'approved', decision: { channel: 'slack', slackUserId: 'U0TX' } });
     await withTransaction(async (tx) => {
       const { makeAuditLogRepo } = await import('../src/modules/auditLog/repo.js');
       const audit = makeAuditLogRepo(tx);

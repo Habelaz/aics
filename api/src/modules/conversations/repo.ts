@@ -7,7 +7,8 @@ export type Conversation = {
   answer: string;
   confidence: Confidence;
   created_at: Date;
-  request_id: string;
+  /** NULL for rows that predate request tracking. See migration 008. */
+  request_id: string | null;
   session_id: string | null;
   sources: unknown;
   latency_ms: number | null;
@@ -34,6 +35,11 @@ export function makeConversationRepo(db: Queryable) {
      * Read path. The production writer is the n8n workflow's Log to Postgres
      * node — see docs/stage5-plan.md §2.2. This repo never writes rows in the
      * request path; the insert below exists for seeding and tests.
+     */
+    /**
+     * Correlation lookup for a request_id minted by the API. Legacy rows have a
+     * NULL request_id and are deliberately unreachable from here, which is why
+     * this never returns them.
      */
     async findByRequestId(requestId: string): Promise<Conversation | null> {
       return one<Conversation>(db, 'SELECT * FROM conversations WHERE request_id = $1', [
@@ -89,7 +95,11 @@ export function makeConversationRepo(db: Queryable) {
       question: string;
       answer: string;
       confidence: Confidence;
-      requestId: string;
+      /**
+       * Optional only for legacy rows. Production inserts come from the n8n
+       * workflow, which always receives a request_id minted by the API.
+       */
+      requestId?: string | null;
       sessionId?: string | null;
       sources?: unknown[];
       latencyMs?: number | null;
@@ -104,7 +114,7 @@ export function makeConversationRepo(db: Queryable) {
           input.question,
           input.answer,
           input.confidence,
-          input.requestId,
+          input.requestId ?? null,
           input.sessionId ?? null,
           JSON.stringify(input.sources ?? []),
           input.latencyMs ?? null,

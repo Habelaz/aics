@@ -154,10 +154,12 @@ export function makeTicketRepo(db: Queryable) {
     /**
      * Dashboard triage.
      *
-     * Allowed from pending, open, approved and in_progress: the first two are
-     * pre-decision states, and the latter two are the human workflow an agent
-     * drives to completion. Excluded are rejected, timed_out and resolved, so a
-     * closed ticket can never be silently reopened by a status write.
+     * Only approved and in_progress may be triaged. Those are the states a
+     * human has already decided and an agent now owns; they are excluded from
+     * open/pending because moving out of them means making a decision without
+     * recording who decided, which escalation_tickets_decider_present_check
+     * rejects at the database level. Rejected, timed_out and resolved are
+     * excluded too, so a closed ticket can never be silently reopened.
      */
     async triage(input: {
       id: number;
@@ -175,7 +177,7 @@ export function makeTicketRepo(db: Queryable) {
                 resolved_at = CASE WHEN $2::varchar = 'resolved' THEN NOW() ELSE resolved_at END
           WHERE id = $1
             AND (
-              status IN ('pending', 'open', 'approved', 'in_progress')
+              status IN ('approved', 'in_progress')
               OR $2::varchar IS NULL
             )
           RETURNING *`,
@@ -212,6 +214,7 @@ export function makeTicketRepo(db: Queryable) {
         `UPDATE escalation_tickets
             SET status = 'timed_out',
                 decided_at = NOW(),
+                decision_channel = 'api',
                 resolved_at = NOW()
           WHERE status = 'pending'
             AND created_at < NOW() - ($1 || ' minutes')::interval
